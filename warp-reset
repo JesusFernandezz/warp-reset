@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# warp-reset: rota la IP de Cloudflare WARP re-registrando el cliente.
+# Funciona con el warp-cli de Linux o, en WSL, con el warp-cli.exe de Windows.
+set -euo pipefail
+
+VERSION="0.1.0"
+WARP_ON_TIMEOUT="${WARP_ON_TIMEOUT:-45}"  # segundos esperando warp=on
+NEW_IP_TIMEOUT="${NEW_IP_TIMEOUT:-45}"    # segundos extra esperando una IP distinta
+POLL_SECS=2
+TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
+WSL_WARP_PATH="/mnt/c/Program Files/Cloudflare/Cloudflare WARP/warp-cli.exe"
+
+usage() {
+  cat <<EOF
+warp-reset $VERSION
+Uso: warp-reset [-h|--help] [-v|--version]
+
+Variables de entorno:
+  WARP_CLI          ruta al warp-cli a usar (por defecto se autodetecta)
+  WARP_ON_TIMEOUT   segundos esperando a que el tráfico salga por WARP (45)
+  NEW_IP_TIMEOUT    segundos extra esperando una IP distinta (45)
+
+Códigos de salida: 0 IP cambió, 1 error de uso, 2 IP igual, 3 WARP no se activó.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  -v|--version) echo "$VERSION"; exit 0 ;;
+  "") ;;
+  *) usage >&2; exit 1 ;;
+esac
+
+find_warp_cli() {
+  if [ -n "${WARP_CLI:-}" ]; then echo "$WARP_CLI"; return; fi
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    if [ -x "$WSL_WARP_PATH" ]; then echo "$WSL_WARP_PATH"; return; fi
+    command -v warp-cli.exe && return
+  fi
+  command -v warp-cli || true
+}
+
+WARP="$(find_warp_cli)"
+if [ -z "$WARP" ] || [ ! -x "$WARP" ]; then
+  echo "No encuentro warp-cli. Instalá Cloudflare WARP (ver README) o definí WARP_CLI." >&2
+  exit 1
+fi
+
+warp() { "$WARP" --accept-tos "$@" | tr -d '\r'; }
+
+# Imprime "<ip> <warp>" (warp = on|off|plus); vacío si falla la consulta.
+trace() {
+  curl -fsS --max-time 5 "$TRACE_URL" 2>/dev/null \
+    | awk -F= '$1=="ip"{ip=$2} $1=="warp"{w=$2} END{if (ip) print ip, w}'
+}
+
+before_ip=$(trace | cut -d' ' -f1 || true)
+echo "IP antes:   ${before_ip:-?}"
+
+warp disconnect || true
+warp registration delete || true
+warp registration new
+warp connect
+
+# Fase 1: esperar a que el tráfico realmente salga por WARP.
+after_ip=""
+state=""
+deadline=$((SECONDS + WARP_ON_TIMEOUT))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  read -r ip state <<<"$(trace)" || true
+  if [ -n "${ip:-}" ] && [ "${state:-off}" != "off" ]; then
+    after_ip=$ip
+    break
+  fi
+  sleep "$POLL_SECS"
+done
+
+if [ -z "$after_ip" ]; then
+  echo "WARP no quedó activo tras ${WARP_ON_TIMEOUT}s (warp=off)." >&2
+  exit 3
+fi
+
+# Fase 2: si ya estabas en WARP, la IP vieja puede persistir unos segundos.
+deadline=$((SECONDS + NEW_IP_TIMEOUT))
+while [ "$after_ip" = "$before_ip" ] && [ "$SECONDS" -lt "$deadline" ]; do
+  sleep "$POLL_SECS"
+  read -r ip state <<<"$(trace)" || true
+  if [ -n "${ip:-}" ] && [ "${state:-off}" != "off" ]; then
+    after_ip=$ip
+  fi
+done
+
+echo "IP después: $after_ip (warp=${state:-on})"
+
+if [ "$before_ip" = "$after_ip" ]; then
+  echo "La IP no cambió tras ${NEW_IP_TIMEOUT}s extra." >&2
+  exit 2
+fi
