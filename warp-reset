@@ -7,6 +7,7 @@ VERSION="0.1.0"
 WARP_ON_TIMEOUT="${WARP_ON_TIMEOUT:-45}"  # segundos esperando warp=on
 NEW_IP_TIMEOUT="${NEW_IP_TIMEOUT:-45}"    # segundos extra esperando una IP distinta
 POLL_SECS=2
+TOTAL=5                                   # pasos de la barra de progreso
 TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
 WSL_WARP_PATH="/mnt/c/Program Files/Cloudflare/Cloudflare WARP/warp-cli.exe"
 
@@ -19,8 +20,10 @@ Variables de entorno:
   WARP_CLI          ruta al warp-cli a usar (por defecto se autodetecta)
   WARP_ON_TIMEOUT   segundos esperando a que el tráfico salga por WARP (45)
   NEW_IP_TIMEOUT    segundos extra esperando una IP distinta (45)
+  NO_COLOR          si está definida, desactiva los colores
 
-Códigos de salida: 0 IP cambió, 1 error de uso, 2 IP igual, 3 WARP no se activó.
+Códigos de salida: 0 IP cambió, 1 error de uso o de warp-cli, 2 IP igual,
+3 WARP no se activó.
 EOF
 }
 
@@ -31,6 +34,65 @@ case "${1:-}" in
   *) usage >&2; exit 1 ;;
 esac
 
+# --- Presentación -----------------------------------------------------------
+# Terminal: barra de progreso con color. Salida redirigida: solo las dos líneas
+# de IP, sin adornos. Locale UTF-8: una barra que se redibuja en el lugar;
+# si no, una línea ASCII por paso.
+TTY=0; [ -t 1 ] && TTY=1
+if [ "$TTY" = 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GREEN=$'\e[32m'; RST=$'\e[0m'
+else
+  BOLD=""; DIM=""; RED=""; GREEN=""; RST=""
+fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) FILL="█"; EMPTY="░"; BAR_W=20; INPLACE=1 ;;
+  *) FILL="#"; EMPTY="-"; BAR_W=10; INPLACE=0 ;;
+esac
+
+err() {
+  if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+    printf '\e[31m%s\e[0m\n' "$*" >&2
+  else
+    printf '%s\n' "$*" >&2
+  fi
+}
+
+# bar <completados>: barra de BAR_W celdas.
+bar() {
+  local filled=$(( $1 * BAR_W / TOTAL )) i out=""
+  for ((i = 0; i < BAR_W; i++)); do
+    if [ "$i" -lt "$filled" ]; then out+=$FILL; else out+=$EMPTY; fi
+  done
+  printf '%s' "$out"
+}
+
+# draw <completados> <etiqueta> [extra]: (re)dibuja la línea de progreso.
+draw() {
+  [ "$TTY" = 1 ] || return 0
+  local n=$1 label=$2 extra=${3:-} count
+  if [ "$INPLACE" = 1 ]; then
+    count="$(( n < TOTAL ? n + 1 : n ))/$TOTAL"
+  else
+    count=$(printf '%3d%%' $(( n * 100 / TOTAL )))
+  fi
+  printf '\r\e[K[%s%s%s]  %s  %s' "$GREEN" "$(bar "$n")" "$RST" "$count" "$label"
+  [ -z "$extra" ] || printf '  %s%s%s' "$DIM" "$extra" "$RST"
+}
+
+# step_done <paso> <etiqueta>: en modo ASCII deja una línea por paso completado.
+step_done() {
+  [ "$INPLACE" = 1 ] || { draw $(( $1 + 1 )) "$2"; [ "$TTY" != 1 ] || echo; }
+}
+
+# step_fail <completados> <etiqueta>: cierra la línea de progreso marcando el fallo.
+step_fail() {
+  [ "$TTY" = 1 ] || return 0
+  printf '\r\e[K[%s]  %sFALLÓ%s  %s\n' "$(bar "$1")" "$RED" "$RST" "$2"
+}
+
+trap '[ "$TTY" != 1 ] || echo; exit 130' INT
+
+# --- warp-cli ---------------------------------------------------------------
 find_warp_cli() {
   if [ -n "${WARP_CLI:-}" ]; then echo "$WARP_CLI"; return; fi
   if grep -qi microsoft /proc/version 2>/dev/null; then
@@ -42,30 +104,54 @@ find_warp_cli() {
 
 WARP="$(find_warp_cli)"
 if [ -z "$WARP" ] || [ ! -x "$WARP" ]; then
-  echo "No encuentro warp-cli. Instalá Cloudflare WARP (ver README) o definí WARP_CLI." >&2
+  err "No encuentro warp-cli. Instalá Cloudflare WARP (ver README) o definí WARP_CLI."
   exit 1
 fi
 
 warp() { "$WARP" --accept-tos "$@" | tr -d '\r'; }
 
+# run_step <paso> <etiqueta> <estricto 1|0> <args de warp-cli...>
+# Silencia la salida de warp-cli; solo la muestra si el comando falla.
+run_step() {
+  local n=$1 label=$2 strict=$3 out; shift 3
+  draw "$n" "$label"
+  if ! out=$(warp "$@" 2>&1) && [ "$strict" = 1 ]; then
+    step_fail "$n" "$label"
+    err "warp-cli $* falló:"
+    err "$out"
+    exit 1
+  fi
+  step_done "$n" "$label"
+}
+
 # Imprime "<ip> <warp>" (warp = on|off|plus); vacío si falla la consulta.
 trace() {
-  curl -fsS --max-time 5 "$TRACE_URL" 2>/dev/null \
+  curl -4 -fsS --max-time 5 "$TRACE_URL" 2>/dev/null \
     | awk -F= '$1=="ip"{ip=$2} $1=="warp"{w=$2} END{if (ip) print ip, w}'
 }
 
+# --- Flujo ------------------------------------------------------------------
+START=$SECONDS
 before_ip=$(trace | cut -d' ' -f1 || true)
-echo "IP antes:   ${before_ip:-?}"
+if [ "$TTY" = 1 ]; then
+  printf '%swarp-reset %s%s\n\nIP antes      %s%s%s\n\n' \
+    "$BOLD" "$VERSION" "$RST" "$BOLD" "${before_ip:-?}" "$RST"
+else
+  echo "IP antes:   ${before_ip:-?}"
+fi
 
-warp disconnect || true
-warp registration delete || true
-warp registration new
-warp connect
+run_step 0 "Desconectando WARP"          0 disconnect
+run_step 1 "Borrando registro anterior"  0 registration delete
+run_step 2 "Creando registro nuevo"      1 registration new
+run_step 3 "Conectando"                  1 connect
 
 # Fase 1: esperar a que el tráfico realmente salga por WARP.
+LABEL="Esperando salida por WARP"
 after_ip=""
 state=""
+t0=$SECONDS
 deadline=$((SECONDS + WARP_ON_TIMEOUT))
+draw 4 "$LABEL" "0s/${WARP_ON_TIMEOUT}s"
 while [ "$SECONDS" -lt "$deadline" ]; do
   read -r ip state <<<"$(trace)" || true
   if [ -n "${ip:-}" ] && [ "${state:-off}" != "off" ]; then
@@ -73,26 +159,49 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     break
   fi
   sleep "$POLL_SECS"
+  draw 4 "$LABEL" "$((SECONDS - t0))s/${WARP_ON_TIMEOUT}s"
 done
 
 if [ -z "$after_ip" ]; then
-  echo "WARP no quedó activo tras ${WARP_ON_TIMEOUT}s (warp=off)." >&2
+  step_fail 4 "$LABEL"
+  err "WARP no quedó activo tras ${WARP_ON_TIMEOUT}s (warp=off). Revisá con: warp-cli status"
   exit 3
 fi
 
 # Fase 2: si ya estabas en WARP, la IP vieja puede persistir unos segundos.
-deadline=$((SECONDS + NEW_IP_TIMEOUT))
-while [ "$after_ip" = "$before_ip" ] && [ "$SECONDS" -lt "$deadline" ]; do
-  sleep "$POLL_SECS"
-  read -r ip state <<<"$(trace)" || true
-  if [ -n "${ip:-}" ] && [ "${state:-off}" != "off" ]; then
-    after_ip=$ip
-  fi
-done
+if [ "$after_ip" = "$before_ip" ]; then
+  LABEL="Esperando una IP distinta"
+  t0=$SECONDS
+  deadline=$((SECONDS + NEW_IP_TIMEOUT))
+  draw 4 "$LABEL" "0s/${NEW_IP_TIMEOUT}s"
+  while [ "$after_ip" = "$before_ip" ] && [ "$SECONDS" -lt "$deadline" ]; do
+    sleep "$POLL_SECS"
+    read -r ip state <<<"$(trace)" || true
+    if [ -n "${ip:-}" ] && [ "${state:-off}" != "off" ]; then
+      after_ip=$ip
+    fi
+    draw 4 "$LABEL" "$((SECONDS - t0))s/${NEW_IP_TIMEOUT}s"
+  done
+fi
 
-echo "IP después: $after_ip (warp=${state:-on})"
+show_after() {
+  if [ "$TTY" = 1 ]; then
+    printf '\nIP después    %s%s%s  %s(warp=%s)%s\n' \
+      "$BOLD" "$after_ip" "$RST" "$DIM" "${state:-on}" "$RST"
+  else
+    echo "IP después: $after_ip (warp=${state:-on})"
+  fi
+}
 
 if [ "$before_ip" = "$after_ip" ]; then
-  echo "La IP no cambió tras ${NEW_IP_TIMEOUT}s extra." >&2
+  step_fail 4 "$LABEL"
+  show_after
+  err "La IP no cambió tras ${NEW_IP_TIMEOUT}s extra. Cloudflare puede devolver la misma; reintentá."
   exit 2
 fi
+
+elapsed=$((SECONDS - START))
+if [ "$INPLACE" = 1 ]; then draw 5 "Listo (${elapsed}s)"; else draw 5 "$LABEL"; fi
+[ "$TTY" != 1 ] || echo
+show_after
+[ "$TTY" != 1 ] || printf '%sListo: la IP cambió (%ss)%s\n' "$GREEN" "$elapsed" "$RST"
