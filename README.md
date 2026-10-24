@@ -154,6 +154,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 warp-reset
 ```
 
+> [!WARNING]
 > ⚠️ `registration delete` borra tu registro de WARP. Si usás una cuenta de Zero Trust o WARP+, te desvincula de ella. Este script está pensado para el WARP gratuito.
 
 ## Configuración
@@ -196,6 +197,7 @@ NEW_IP_TIMEOUT=90 warp-reset
 
 ## Aviso
 
+> [!CAUTION]
 > 🚫 Cambiar de IP para evitar límites de uso de un servicio puede violar sus términos. Usalo bajo tu responsabilidad y revisá las condiciones del servicio que consumís. El proyecto no está afiliado a Cloudflare.
 
 ## Licencia
