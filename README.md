@@ -15,8 +15,14 @@ Script de Bash que borra el registro del cliente WARP, crea uno nuevo, reconecta
 
 ```console
 $ warp-reset
-IP antes:   203.0.113.10
-IP después: 2a09:bac5:7d:1b9::2c:ea (warp=on)
+warp-reset 0.1.0
+
+IP antes      203.0.113.10
+
+[████████████████████]  5/5  Listo (14s)
+
+IP después    2a09:bac5:7d:1b9::2c:ea  (warp=on)
+Listo: la IP cambió (14s)
 ```
 
 ## Inicio rápido
@@ -166,6 +172,7 @@ Variables de entorno opcionales:
 | `WARP_CLI` | autodetecta | Ruta al ejecutable `warp-cli` |
 | `WARP_ON_TIMEOUT` | `45` | Segundos esperando a que el tráfico salga por WARP |
 | `NEW_IP_TIMEOUT` | `45` | Segundos extra esperando una IP distinta de la anterior |
+| `NO_COLOR` | sin definir | Si está definida, desactiva los colores |
 
 Ejemplo:
 
@@ -174,6 +181,8 @@ NEW_IP_TIMEOUT=90 warp-reset
 ```
 
 ## Qué hace
+
+En una terminal muestra una barra de progreso con los pasos (bloques UTF-8, o `#` y `-` si el locale no es UTF-8). Si redirigís la salida a un pipe o archivo, imprime solo las dos líneas de IP, sin colores.
 
 1. Guarda la IP actual consultando `https://www.cloudflare.com/cdn-cgi/trace`.
 2. Ejecuta `warp-cli disconnect`, `registration delete`, `registration new` y `connect`.
@@ -185,14 +194,14 @@ NEW_IP_TIMEOUT=90 warp-reset
 | Código | Significado |
 |---|---|
 | `0` | La IP cambió |
-| `1` | Error de uso o no se encontró `warp-cli` |
+| `1` | Error de uso, no se encontró `warp-cli` o un comando de `warp-cli` falló |
 | `2` | La IP no cambió tras el tiempo de espera |
 | `3` | WARP no se activó (`warp=off`) |
 
 ## Limitaciones
 
 - **Misma IP:** Cloudflare asigna IPs por región y datacenter. Un registro nuevo puede devolver la misma IP, y el script termina con código `2` aunque el reset haya funcionado.
-- **IPv6:** el trace muestra la IP que usa `curl` por defecto, que puede ser IPv6. Para ver la IPv4: `curl -4 -s https://www.cloudflare.com/cdn-cgi/trace`.
+- **Solo IPv4:** el script consulta el trace con `curl -4`, así que siempre muestra y compara la IPv4. Una IPv6 distinta no cuenta como cambio.
 - **Corte breve:** durante unos segundos no tenés conexión por WARP.
 
 ## Aviso
